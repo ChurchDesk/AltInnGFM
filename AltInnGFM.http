@@ -1,0 +1,6 @@
+@AltInnGFM_HostAddress = http://localhost:5051
+
+GET {{AltInnGFM_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
