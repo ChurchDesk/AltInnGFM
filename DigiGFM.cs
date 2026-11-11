@@ -237,6 +237,7 @@ namespace KipWeb5API
         public int TypeLogg { get; set; } = 0;
         public string? SQLkode { get; set; } = "";
         public string? LinkGuid { get; set; } = "";
+        public int? Status { get; set; } = 0;
         public AccountLogOnInfoItem logonInfo = new AccountLogOnInfoItem();
     }
 

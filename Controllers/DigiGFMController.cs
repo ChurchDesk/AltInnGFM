@@ -3,8 +3,10 @@ using kip.kirkedata.webservices;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.SignalR.Protocol;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.VisualBasic;
@@ -22,24 +24,32 @@ using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using System.Security.Claims;
 using System.Security.Cryptography;
+using System.ServiceModel.Channels;
 using System.Text;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using static System.Net.Mime.MediaTypeNames;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 
+
 namespace KipWeb5API.Controllers
 {
     public class DigiGFMController : Controller
     {
         private readonly IConfiguration Configuration;
+        private readonly ILogger<DigiGFMController> _logger;
 
-        public DigiGFMController(IConfiguration configuration)
+        KipWebServiceSoapClient kw = new KipWebServiceSoapClient(new KipWebServiceSoapClient.EndpointConfiguration());
+
+        public DigiGFMController(IConfiguration configuration, ILogger<DigiGFMController> logger)
         {
             Configuration = configuration;
+            _logger = logger;
 
             string url = configuration["MySettings:WebserviceKipUrl"] ?? throw new InvalidOperationException("WebserviceKipUrl mangler i appsettings.json");
-            KipWebServiceSoapClient kw = new KipWebServiceSoapClient(KipWebServiceSoapClient.EndpointConfiguration.KipWebServiceSoap, url);
+            kw.Endpoint.Address = new System.ServiceModel.EndpointAddress(url);
+
+            _logger.LogWarning("DigiGFMController er opprettet");
         }
 
         [Route("NewFuneral")]
@@ -51,6 +61,10 @@ namespace KipWeb5API.Controllers
             string loggJson = "";
             string versjon = "v1";
             int resultat = 200;
+
+            bool sendOnSuccess = Configuration.GetValue<bool>("DgmNotifications:Enabled") && Configuration.GetValue<bool>("DgmNotifications:SendOnSuccess");
+
+            _logger.LogInformation("NewFuneral registreres");
 
             string id = Guid.NewGuid().ToString();
             if (item != null && item.id != null) {
@@ -68,12 +82,16 @@ namespace KipWeb5API.Controllers
 
             AccountLogOnInfoItem logonInfo = new();
             LoggItem loggItem = new();
+            LoggItem loggStatusItem = new();
+
             logonInfo.Server = "officedb.kirkedata.no";
             logonInfo.Database = "G6";
 
             var environment = Configuration["MySettings:Environment"];
 
             string json = JsonConvert.SerializeObject(item);
+
+            _logger.LogInformation(json);
 
             #region Set logg
 
@@ -86,7 +104,12 @@ namespace KipWeb5API.Controllers
                 loggItem.LinkGuid = id;
                 loggJson = JsonConvert.SerializeObject(loggItem);
 
-                res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                string jsonResult = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
+                LoggResponse? result = JsonConvert.DeserializeObject<LoggResponse>(jsonResult);
+                if (result != null) {
+                    res = result.Response.ToString();
+                    loggStatusItem.Logg_guid = result.LoggGuid;
+                    }
                 }
             else {
                 res="200";
@@ -97,8 +120,16 @@ namespace KipWeb5API.Controllers
             if (res == "200") {
 
                 if (item.data != null) {
-                    //ControllFuneralItem cntrItem = new();
-                    //cntrItem.responsibilityStatementId = item.data.responsibilityStatementId;
+
+                    SrcLogonInfo libm = new();
+                    libm.BrukerId = "support";
+                    libm.Passord = "Morten09gutt";
+                    libm.Server = "OfficeDb.Kirkedata.no";
+                    libm.Database = "G6";
+
+                    libm.AktivFellesraad = "3333";
+                    libm.EPostAdresse = "9001.gravplassmyndighet@kirkedata.no";
+                    libm.EPostPassord = "m03raswebo$pu7Up_ec7";
 
                     if (item.data.graveyardAuthorities != null && item.data.submissionId != "")
                     {
@@ -119,6 +150,12 @@ namespace KipWeb5API.Controllers
                             if (res == "true") {
                                 locId = lId;
 
+                                loggStatusItem.Status = 1;
+                                loggJson = JsonConvert.SerializeObject(loggStatusItem);
+                                res = await ExecuteJsonG6("POST", "Funksjoner", "UpdateLoggDGM", loggJson, "");
+
+                                if (sendOnSuccess) await SendDgmNotification(libm, "DGM v2 - Newfuneral", "Newfuneral med id: " + item.data.submissionId);
+
                                 if (item.data.submissionId != null && item.data.submissionId != "") {
                                     PetitionItem? itmP = new();
 
@@ -129,97 +166,134 @@ namespace KipWeb5API.Controllers
 
                                     string result = await getPetitionsItem(itmPI, id);
 
-                                    itmP = JsonConvert.DeserializeObject<PetitionItem>(result);
-
-
-                                    if (itmP != null && itmP.stakeholderId.Length > 0)
+                                    if (result.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase))
                                     {
-                                        itmP.logonInfo = logonInfo;
 
-                                        FuneralItem? itmF = await getFuneralV2Item(item.data.funeralId, locId, "", id);
-                                        itmP.funeral = itmF;
-                                        itmP.funeralHomeId = item.data.funeralHomeId;
-                                        itmP.submissionId = item.data.submissionId;
-                                        itmP.funeralId = item.data.funeralId;
+                                        _logger.LogWarning("Unauthorized");
 
-                                        StakeholderAdressItem? itmSA = await getStakeholdersV2Item(item.data.stakeholderId, locId, "");
 
-                                        itmP.funeral.funeralResponsible.address = itmSA;
+                                        loggStatusItem.Status = 99;
+                                        loggJson = JsonConvert.SerializeObject(loggStatusItem);
+                                        res = await ExecuteJsonG6("POST", "Funksjoner", "UpdateLoggDGM", loggJson, "");
 
-                                        if (environment != "prod")
+                                        if (sendOnSuccess) await SendDgmNotification(libm, "DGM v2 - Newfuneral", "Newfuneral med id: " + item.data.submissionId + " fikk følgende feil: " + result);
+
+                                        resultat = 500;
+                                    }
+                                    else if (result.Contains("Not found", StringComparison.OrdinalIgnoreCase))
+                                    {
+
+                                        _logger.LogWarning("Not found");
+
+                                        loggStatusItem.Status = 98;
+                                        loggJson = JsonConvert.SerializeObject(loggStatusItem);
+                                        res = await ExecuteJsonG6("POST", "Funksjoner", "UpdateLoggDGM", loggJson, "");
+
+                                        if (sendOnSuccess) await SendDgmNotification(libm, "DGM v2 - Newfuneral", "Newfuneral med id: " + item.data.submissionId + " fikk følgende feil: " + result);
+
+                                        resultat = 500;
+                                    }
+                                    else
+                                    { 
+                                        itmP = JsonConvert.DeserializeObject<PetitionItem>(result);
+
+
+                                        if (itmP != null && !string.IsNullOrWhiteSpace(itmP.stakeholderId))
                                         {
+                                            loggStatusItem.Status = 2;
+                                            loggJson = JsonConvert.SerializeObject(loggStatusItem);
+                                            res = await ExecuteJsonG6("POST", "Funksjoner", "UpdateLoggDGM", loggJson, "");
+
+                                            itmP.logonInfo = logonInfo;
+
+                                            FuneralItem? itmF = await getFuneralV2Item(item.data.funeralId, locId, "", id);
+                                            itmP.funeral = itmF;
+                                            itmP.funeralHomeId = itmP.data.responsibilityStatement.funeralHomeId;
+                                            itmP.submissionId = item.data.submissionId;
+                                            itmP.funeralId = item.data.funeralId;
+
+                                            StakeholderAdressItem? itmSA = await getStakeholdersV2Item(item.data.stakeholderId, locId, "");
+
+                                            itmP.funeral.funeralResponsible.address = itmSA;
+
+                                            if (environment != "prod")
+                                            {
                                             
-                                            itmP.data.responsibilityStatement.placeOfDeathLocationId = "3333";
+                                                itmP.data.responsibilityStatement.placeOfDeathLocationId = "3333";
                                             
-                                            if (itmP.data.responsibilityStatement.cremation  != null)
-                                                itmP.data.responsibilityStatement.cremation.urnBurialLocationId = "3333";
+                                                if (itmP.data.responsibilityStatement.cremation  != null)
+                                                    itmP.data.responsibilityStatement.cremation.urnBurialLocationId = "3333";
 
-                                            if (itmP.funeral.deceased.address != null)
-                                                itmP.funeral.deceased.address.municipality = "3333";
-                                        }
+                                                if (itmP.funeral.deceased.address != null)
+                                                    itmP.funeral.deceased.address.municipality = "3333";
+                                            }
 
-                                        json = JsonConvert.SerializeObject(itmP);
+                                            json = JsonConvert.SerializeObject(itmP);
 
-                                        if (environment == "prod")
-                                        {
+                                            if (environment == "prod")
+                                            {
 
-                                            loggItem.logonInfo = logonInfo;
-                                            loggItem.Beskrivelse = json;
-                                            loggItem.Program = "NewFuneral";
-                                            loggItem.Av = "KipWeb5API";
-                                            loggItem.LinkGuid = id;
-                                            loggItem.TypeLogg = 200;
+                                                loggItem.logonInfo = logonInfo;
+                                                loggItem.Beskrivelse = json;
+                                                loggItem.Program = "NewFuneral";
+                                                loggItem.Av = "KipWeb5API";
+                                                loggItem.LinkGuid = id;
+                                                loggItem.TypeLogg = 200;
 
-                                            loggJson = JsonConvert.SerializeObject(loggItem);
-                                            res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
-                                        }
+                                                loggJson = JsonConvert.SerializeObject(loggItem);
+                                                res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
+                                            }
 
-                                        string resBest = await ExecuteJsonG6("POST", "Bestilling", "SetAltInnBestillingV2", json, "");
+                                            string resBest = await ExecuteJsonG6("POST", "Bestilling", "SetAltInnBestillingV2", json, "");
 
-                                        if (resBest != null && resBest.Length > 0)
-                                        {
-                                            behandletFellesraad.Add(logonInfo.Fellesraad);
-                                            await postPetitionsConfirm(item.data.submissionId, locId, "", id);
+
+
+                                            if (Guid.TryParse(resBest, out Guid bestillingGuid))
+                                            {
+                                                loggStatusItem.Status = 9;
+                                                loggJson = JsonConvert.SerializeObject(loggStatusItem);
+                                                res = await ExecuteJsonG6("POST", "Funksjoner", "UpdateLoggDGM", loggJson, "");
+
+                                                if (sendOnSuccess) await SendDgmNotification(libm, "DGM v2 - Newfuneral", "Newfuneral:  Id: " + item.data.submissionId + " er nå registrert i Bestilling med id : " + resBest);
+
+
+                                                behandletFellesraad.Add(logonInfo.Fellesraad);
+                                                await postPetitionsConfirm(item.data.submissionId, locId, "", id);
+                                            }
+                                            else
+                                            {
+                                                loggStatusItem.Status = 99;
+                                                loggJson = JsonConvert.SerializeObject(loggStatusItem);
+                                                res = await ExecuteJsonG6("POST", "Funksjoner", "UpdateLoggDGM", loggJson, "");
+
+                                                if (sendOnSuccess) await SendDgmNotification(libm, "DGM v2 - Newfuneral", "Newfuneral med id: " + item.data.submissionId + " fikk følgende feil: " + resBest);
+
+                                                resultat = 500;
+                                            }
+
+                                            if (environment == "prod") {
+                                                loggItem.logonInfo = logonInfo;
+                                                if (resBest != null) loggItem.Beskrivelse = resBest;
+                                                loggItem.Program = "NewFuneral";
+                                                loggItem.Av = "KipWeb5API";
+                                                loggItem.LinkGuid = id;
+                                                loggItem.TypeLogg = 201;
+
+                                                loggJson = JsonConvert.SerializeObject(loggItem);
+                                                res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
+                                            }
+
                                         }
                                         else
                                         {
+                                            loggStatusItem.Status = 99;
+                                            loggJson = JsonConvert.SerializeObject(loggStatusItem);
+                                            res = await ExecuteJsonG6("POST", "Funksjoner", "UpdateLoggDGM", loggJson, "");
+
+                                            if (sendOnSuccess) await SendDgmNotification(libm, "DGM v2 - Newfuneral", "Newfuneral med id: " + item.data.submissionId + " fikk følgende feil: " + result);
+
                                             resultat = 500;
                                         }
-
-                                        if (environment == "prod") {
-                                            loggItem.logonInfo = logonInfo;
-                                            if (resBest != null) loggItem.Beskrivelse = resBest;
-                                            loggItem.Program = "NewFuneral";
-                                            loggItem.Av = "KipWeb5API";
-                                            loggItem.LinkGuid = id;
-                                            loggItem.TypeLogg = 201;
-
-                                            loggJson = JsonConvert.SerializeObject(loggItem);
-                                            res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
-                                        }
-
-                                    }
-                                    else
-                                    {
-                                        KipWebServiceSoapClient kw = new KipWebServiceSoapClient(new KipWebServiceSoapClient.EndpointConfiguration());
-
-                                        SrcLogonInfo libm = new();
-                                        libm.BrukerId = "support";
-                                        libm.Passord = "Morten09gutt";
-                                        libm.Server = "OfficeDb.Kirkedata.no";
-                                        libm.Database = "G6";
-
-                                        libm.AktivFellesraad = "3333";
-                                        libm.EPostAdresse = "9001.gravplassmyndighet@kirkedata.no";
-                                        libm.EPostPassord = "m03raswebo$pu7Up_ec7";
-
-                                        SrcSendMailItems embm = new();
-                                        embm.subject = "DGM v2 - Newfuneral";
-                                        embm.mailTo = "eaa@churchdesk.com; ob@churchdesk.com;";
-                                        embm.body = "Newfuneral med id: " + item.data.submissionId + " fikk følgende feil: " + result;
-                                        await kw.SendEPostAsync(libm, embm);
-
-                                        resultat = 500;
                                     }
                                 }
 
@@ -251,6 +325,17 @@ namespace KipWeb5API.Controllers
                             {
                                 if (item.data.submissionId != null && item.data.submissionId != "")
                                 {
+
+                                    loggStatusItem.Status = 10;
+                                    loggJson = JsonConvert.SerializeObject(loggStatusItem);
+                                    res = await ExecuteJsonG6("POST", "Funksjoner", "UpdateLoggDGM", loggJson, "");
+
+                                    SrcSendMailItems embm = new();
+                                    embm.subject = "DGM v2 - Newfuneral - Krematorium";
+                                    embm.mailTo = "eaa@churchdesk.com;";
+                                    embm.body = "Newfuneral med id: " + item.data.submissionId;
+                                    await kw.SendEPostAsync(libm, embm);
+
                                     PetitionItem? itmP = new();
 
                                     PetitionParameterItem itmPI = new();
@@ -305,13 +390,13 @@ namespace KipWeb5API.Controllers
                                             loggItem.TypeLogg = 300;
 
                                             loggJson = JsonConvert.SerializeObject(loggItem);
-                                            res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                                            res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
                                         }
 
 
                                         string resBest = await ExecuteJsonG6("POST", "Bestilling", "SetAltInnBestillingV2", json, "");
 
-                                        if (resBest != null && resBest.Length > 0)
+                                        if (Guid.TryParse(resBest, out Guid bestillingGuid))
                                         {
                                             await postPetitionsConfirm(item.data.submissionId, "", item.data.crematoriumId, id);
                                         }
@@ -330,29 +415,13 @@ namespace KipWeb5API.Controllers
                                             loggItem.TypeLogg = 201;
 
                                             loggJson = JsonConvert.SerializeObject(loggItem);
-                                            res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                                            res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
                                         }
 
                                     }
                                     else
                                     {
-                                        KipWebServiceSoapClient kw = new KipWebServiceSoapClient(new KipWebServiceSoapClient.EndpointConfiguration());
-
-                                        SrcLogonInfo libm = new();
-                                        libm.BrukerId = "support";
-                                        libm.Passord = "Morten09gutt";
-                                        libm.Server = "OfficeDb.Kirkedata.no";
-                                        libm.Database = "G6";
-
-                                        libm.AktivFellesraad = "3333";
-                                        libm.EPostAdresse = "9001.gravplassmyndighet@kirkedata.no";
-                                        libm.EPostPassord = "m03raswebo$pu7Up_ec7";
-
-                                        SrcSendMailItems embm = new();
-                                        embm.subject = "DGM v2 - Newfuneral";
-                                        embm.mailTo = "eaa@churchdesk.com; ob@churchdesk.com;";
-                                        embm.body = "Newfuneral krematorium med id: " + item.data.submissionId + " fikk følgende feil: " + result;
-                                        await kw.SendEPostAsync(libm, embm);
+                                        if (sendOnSuccess) await SendDgmNotification(libm, "DGM v2 - Newfuneral", "Newfuneral krematorium med id: " + item.data.submissionId + " fikk følgende feil: " + result);
 
                                         resultat = 500;
                                     }
@@ -367,7 +436,27 @@ namespace KipWeb5API.Controllers
                 }                    
             }
 
+            _logger.LogInformation("Newfuneral fullført med resultat: " + resultat.ToString());
+
             return resultat;
+        }
+
+
+        private async Task SendDgmNotification(SrcLogonInfo logonInfo, string subject, string message)
+        {
+            if (!Configuration.GetValue<bool>(
+                "DgmNotifications:Enabled"))
+                return;
+
+            var mail = new SrcSendMailItems
+            {
+                subject = subject,
+                mailTo = Configuration[
+                    "DgmNotifications:Recipient"],
+                body = message
+            };
+
+            await kw.SendEPostAsync(logonInfo, mail);
         }
 
         #region Rutiner for V1
@@ -514,7 +603,7 @@ namespace KipWeb5API.Controllers
 
                 string loggJson = JsonConvert.SerializeObject(loggItem);
 
-                string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
 
                 try
                 {
@@ -667,7 +756,7 @@ namespace KipWeb5API.Controllers
                     logonInfo.Database = "G6";
 
                     loggItem.logonInfo = logonInfo;
-                    loggItem.Beskrivelse = token;
+                    loggItem.Beskrivelse = "Token OK";
                     loggItem.Program = "NewFuneral";
                     loggItem.Av = "KipWeb5API";
                     loggItem.LinkGuid = id;
@@ -675,7 +764,7 @@ namespace KipWeb5API.Controllers
 
                     string loggJson = JsonConvert.SerializeObject(loggItem);
 
-                    string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                    string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
             }
             else
             {
@@ -693,7 +782,7 @@ namespace KipWeb5API.Controllers
 
                 string loggJson = JsonConvert.SerializeObject(loggItem);
 
-                string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
             }
 
             var environment = Configuration["MySettings:Environment"];
@@ -719,7 +808,7 @@ namespace KipWeb5API.Controllers
 
                     string loggJson = JsonConvert.SerializeObject(loggItem);
 
-                    string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                    string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
                 }
             }
             else
@@ -803,7 +892,7 @@ namespace KipWeb5API.Controllers
 
                     string loggJson = JsonConvert.SerializeObject(loggItem);
 
-                    string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                    string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
                 }
 
                 try
@@ -956,7 +1045,7 @@ namespace KipWeb5API.Controllers
 
                     string loggJson = JsonConvert.SerializeObject(loggItem);
 
-                    string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLogg", loggJson, "");
+                    string res = await ExecuteJsonG6("POST", "Funksjoner", "SetLoggDGM", loggJson, "");
                 }
 
                 try
@@ -1272,7 +1361,7 @@ namespace KipWeb5API.Controllers
             return returnToken;
         }
 
-        [Route("SetLogg")]
+        [Route("SetLoggDGM")]
         [HttpPost]
         public string SetLogg(LoggItem item)
         {
