@@ -5,6 +5,13 @@ using System.Runtime.Intrinsics.X86;
 
 namespace KipWeb5API
 {
+    public class LoggResponse
+    {
+        public int Response { get; set; }
+        public string LoggGuid { get; set; } = "";
+        public string Feilmelding { get; set; } = "";
+    }
+
     public class NewFuneralV2Item
     {
         public string? id { get; set; }
@@ -111,11 +118,11 @@ namespace KipWeb5API
 
     public class PetitionDataExistingGraveItem
     {
-        public string graveyardId { get; set; } = "";
+        public string? graveyardId { get; set; } = "";
         public string? graveReference { get; set; } = "";
-        public string graveResponsibleSsn { get; set; } = "";
-        public string lastBuriedPersonName { get; set; } = "";
-        public string lastBurialYear { get; set; } = "";
+        public string? graveResponsibleSsn { get; set; } = "";
+        public string? lastBuriedPersonName { get; set; } = "";
+        public string? lastBurialYear { get; set; } = "";
         public string? graveResponsibleEmail { get; set; }
         public string? graveResponsiblePhone { get; set; }
         public GraveTypeAttributesItem? graveTypeAttributes { get; set; }
